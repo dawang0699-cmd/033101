@@ -77,7 +77,7 @@ function showOnlineToast(message){
 }
 
 function getStoreName(){
-  return '中壢民族店';
+  return '花蓮國聯店';
 }
 
 
