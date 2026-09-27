@@ -5,9 +5,9 @@ import { state, persistAll } from '../core/store.js';
 import { escapeHtml, money, id } from '../core/utils.js';
 import { getDiscountResult, getDiscountType, setDiscountType, handleDiscountInput } from '../modules/cart-service.js';
 import { createOrUpdateOrder, markPendingOrderPaid } from '../modules/order-service.js';
-import { buildCartPreviewOrder, getPrintSettings, printOrderLabels, printOrderReceipt, printKitchenCopies, openCashDrawer, getReceiptHtml } from '../modules/print-service.js';
+import { buildCartPreviewOrder, getPrintSettings, printOrderLabels, printOrderReceipt, printKitchenCopies, printNumberTicket, openCashDrawer, getReceiptHtml } from '../modules/print-service.js';
 import { hasOpenSession } from '../modules/report-session.js';
-import { getRealtimeAuthUser, signInPOSWithGoogle, waitForAuthReady } from '../modules/realtime-order-service.js';
+import { getRealtimeAuthUser, signInPOSWithGoogle, waitForAuthReady, _getRef, _dbApi } from '../modules/realtime-order-service.js';
 // v20260525 新增：客顯同步（購物車更新時推送）
 import { displayCart, displayIdle } from '../modules/customer-display-service.js';
 
@@ -131,8 +131,21 @@ function flattenSelections(product){
       const opt = mod.options.find(o=>o.id===val);
       if(opt) rows.push({moduleId:mod.id, moduleName:mod.name, optionId:opt.id, optionName:opt.name, price:opt.price});
     }
-  }
+   }
   return rows;
+}
+
+function getEffectiveBasePrice(product){
+  const sizes = Array.isArray(product.sizes) ? product.sizes : [];
+  const i = state.currentSizeIndex;
+  if(i >= 0 && sizes[i]) return Number(sizes[i].price || 0);
+  return Number(product.price || 0);
+}
+function getSizeSuffix(product){
+  const sizes = Array.isArray(product.sizes) ? product.sizes : [];
+  const i = state.currentSizeIndex;
+  if(i >= 0 && sizes[i] && sizes[i].name) return '(' + sizes[i].name + ')';
+  return '';
 }
 
 function updateItemPricePreview(product){
@@ -140,7 +153,7 @@ function updateItemPricePreview(product){
   const selections = flattenSelections(product);
   selections.forEach(s=> add += Number(s.price || 0));
   const qty = Math.max(1, Number(document.getElementById('itemQtyInput').value || 1));
-  const subtotal = (Number(product.price||0) + add) * qty;
+  const subtotal = (getEffectiveBasePrice(product) + add) * qty;
   document.getElementById('itemPricePreview').textContent = '小計：' + money(subtotal);
 }
 
@@ -148,7 +161,27 @@ function renderProductConfig(product){
   document.getElementById('productConfigTitle').textContent = product.name + ' - 設定';
   const wrap = document.getElementById('productConfigModules');
   wrap.innerHTML = '';
+  const sizes = Array.isArray(product.sizes) ? product.sizes : [];
+  if(sizes.length){
+    const sizeBlock = document.createElement('div');
+    sizeBlock.className = 'module-block';
+    sizeBlock.innerHTML = '<div class="module-header"><div><strong>份量</strong><div class="muted">單選</div></div></div><div class="option-list"></div>';
+    const sizeList = sizeBlock.querySelector('.option-list');
+    sizes.forEach((sz, idx) => {
+      const b = document.createElement('button');
+      b.type = 'button';
+      b.className = 'option-chip' + (state.currentSizeIndex === idx ? ' active' : '');
+      b.innerHTML = '<span>' + escapeHtml(sz.name) + '</span><strong>' + money(Number(sz.price||0)) + '</strong>';
+      b.onclick = () => {
+        state.currentSizeIndex = (state.currentSizeIndex === idx ? -1 : idx);
+        renderProductConfig(product);
+      };
+      sizeList.appendChild(b);
+    });
+    wrap.appendChild(sizeBlock);
+  }
   (product.modules || []).forEach(att=>{
+
     const mod = state.modules.find(m=>m.id===att.moduleId);
     if(!mod) return;
     const required = att.requiredOverride === null ? mod.required : att.requiredOverride;
@@ -221,15 +254,19 @@ function openProductConfigForNew(productId){
   state.configTarget = {mode:'new', productId};
   state.currentSelections = createConfigState(product);
   document.getElementById('itemNoteInput').value = '';
-  document.getElementById('itemQtyInput').value = 1;
+    document.getElementById('itemQtyInput').value = 1;
+  state.currentSizeIndex = -1;
   renderProductConfig(product);
+
   document.getElementById('productConfigModal').classList.remove('hidden');
 }
 
 function openProductConfigForEdit(rowId){
-  const item = state.cart.find(x=>x.rowId===rowId);
+    const item = state.cart.find(x=>x.rowId===rowId);
   if(!item) return;
+  state.currentSizeIndex = (item.sizeIndex ?? -1);
   const product = state.products.find(p=>p.id===item.productId);
+
   if(!product) return;
   state.configTarget = {mode:'edit', rowId, productId:item.productId};
   state.currentSelections = createConfigState(product);
@@ -245,9 +282,11 @@ function openProductConfigForEdit(rowId){
 
 function closeProductConfig(){
   document.getElementById('productConfigModal').classList.add('hidden');
-  state.configTarget = null;
+    state.configTarget = null;
   state.currentSelections = {};
+  state.currentSizeIndex = -1;
 }
+
 
 function sameSelections(a=[], b=[]){
   if(a.length !== b.length) return false;
@@ -402,6 +441,49 @@ export function renderCart(){
   const badge = document.getElementById('cartBadge');
   if(badge) badge.textContent = state.cart.reduce((s,x)=> s + x.qty, 0);
 }
+function resetOrderTypeFields(){
+    // v20260616: 結帳後重置訂單類型/桌號/預約時段，回到乾淨新單狀態
+    var _otReset = document.getElementById('orderType');
+    if(_otReset) _otReset.value = '內用';
+    var _tableReset = document.getElementById('tableNo');
+    if(_tableReset) _tableReset.value = '';
+    var _slotReset = document.getElementById('posReservationSlot');
+    if(_slotReset){ _slotReset.value = ''; _slotReset.style.display = 'none'; }
+}
+// 線上單結帳／狀態回寫 Firebase：讓顧客端查詢顯示已完成、並讓本機清空後重建能排除已結帳單
+// storeCode 一律用當店設定；失敗只 warn，絕不擋結帳流程（遵守多店防混淆與 Firebase 容錯規範）
+async function syncOnlineOrderStatusToCloud(order, newStatus){
+  try{
+    if(!order) return;
+    // 只處理線上單：id 以 online_ 開頭，還原成 Firebase 原始 id
+    const oid = String(order.id || '');
+    if(oid.indexOf('online_') !== 0) return;
+    const remoteId = oid.slice('online_'.length);
+    if(!remoteId) return;
+
+    const cfg = (state.settings && state.settings.dashboard) || {};
+    const storeCode = cfg.storeId;
+    if(!storeCode) return;
+
+    const ref = await _getRef(`onlineOrders/${storeCode}/${remoteId}`);
+    const api = _dbApi();
+    if(!ref || !api) return;
+
+    const patch = { status: newStatus, updatedAt: new Date().toISOString() };
+    if(newStatus === 'completed') patch.settledAt = new Date().toISOString();
+    await api.update(ref, patch);
+
+    // 同步顧客查詢節點 customerOrderLookup（顧客端「我的訂單」讀這份）
+    const lookupKey = String(order.customerLookupKey || order.customerPhone || '').replace(/\D/g,'');
+    const orderNo = order.orderNo || '';
+    if(lookupKey && remoteId){
+      const lookupRef = await _getRef(`customerOrderLookup/${storeCode}/${lookupKey}/${remoteId}`);
+      if(lookupRef) await api.update(lookupRef, { status: newStatus, updatedAt: new Date().toISOString() });
+    }
+  }catch(e){
+    console.warn('[online-sync] 回寫線上單狀態失敗（不影響結帳）：', e && e.message);
+  }
+}
 
 function finalizeOrder(paymentMethod){
     var mode = document.getElementById('paymentTargetMode').value || 'new';
@@ -410,11 +492,17 @@ function finalizeOrder(paymentMethod){
 
     var order = null;
 
-    if(mode === 'pending'){
+        if(mode === 'pending'){
         order = markPendingOrderPaid(targetOrderId, paymentMethod);
         document.getElementById('paymentModal').classList.add('hidden');
         persistAll();
         window.refreshAllViews();
+
+// 線上單結帳（非待付款）→ 回寫 Firebase，讓顧客端顯示已完成、並標記已結帳
+          if(paymentMethod !== '待付款' && order){
+          syncOnlineOrderStatusToCloud(order, 'completed');
+        }
+
 
         // 開錢箱（依設定 openDrawer，且僅結帳時）
      if(order && paymentMethod === '現金'){
@@ -422,21 +510,35 @@ function finalizeOrder(paymentMethod){
 }
 
 
-// 列印顧客單（路由內部會自動選 Sunmi/藍牙/網路/瀏覽器）
-if(order && paymentMethod !== '待付款' && printConfig.autoPrintCheckout){
-    try { printOrderReceipt(order, 'customer'); }
-    catch(e) { console.error('列印顧客單失敗:', e); }
+// ── 現場訂單列印（待付款只印廚房單；直接結帳印廚房單+顧客單）──
+if(order){
+       
+    // 顧客單：只有真正結帳（非待付款）才印
+  if(paymentMethod !== '待付款' && printConfig.autoPrintCheckout){
+        try { printOrderReceipt(order, 'customer'); }
+        catch(e) { console.error('列印顧客單失敗:', e); }
+    }
+        // 號碼單：現場訂單依開關列印；線上訂單一律不印號碼單
+  if(paymentMethod !== '待付款' && printConfig.autoPrintNumberTicket
+       && !(String(order.id).startsWith('online_') || order.orderType === '線上點餐')){
+        try { printNumberTicket(order); }
+        catch(e) { console.error('列印號碼單失敗:', e); }
+    }
+
 }
+           if(paymentMethod === '待付款'){
+        showToast('已加入待付款', 500);
+      } else if(paymentMethod === '現金' && _cashReceived !== ''){
+        var _recv = Number(_cashReceived) || 0;
+        var _change = Math.max(0, _recv - _cashDue);
+        alert('已完成收款\n實收 $' + _recv + '　找零 $' + _change);
+      } else {
+        alert('已完成收款');
+      }
+      resetOrderTypeFields();
+      return;
 
-// 列印廚房單
-if(order && printConfig.autoPrintKitchen){
-    try { printKitchenCopies(order); }
-    catch(e) { console.error('列印廚房單失敗:', e); }
-}
 
-
-        alert(paymentMethod === '待付款' ? '仍維持待付款' : '已完成收款');
-        return;
     }
 
     order = createOrUpdateOrder(paymentMethod);
@@ -448,20 +550,38 @@ if(order && printConfig.autoPrintKitchen){
 if(order && paymentMethod === '現金'){
     openCashDrawer().catch(function(e){ console.error('開錢箱失敗:', e); });
 }
-// 列印顧客單（路由內部會自動選 Sunmi/藍牙/網路/瀏覽器）
-if(order && paymentMethod !== '待付款' && printConfig.autoPrintCheckout){
-    try { printOrderReceipt(order, 'customer'); }
-    catch(e) { console.error('列印顧客單失敗:', e); }
+// ── 現場訂單列印（待付款只印廚房單；直接結帳印廚房單+顧客單）──
+if(order){
+    // 廚房單：待付款與結帳都印
+    if(printConfig.autoPrintKitchen){
+        try { printKitchenCopies(order); }
+        catch(e) { console.error('列印廚房單失敗:', e); }
+    }
+    // 顧客單：只有真正結帳（非待付款）才印
+    if(paymentMethod !== '待付款' && printConfig.autoPrintCheckout){
+        try { printOrderReceipt(order, 'customer'); }
+        catch(e) { console.error('列印顧客單失敗:', e); }
+    }
+       // 號碼單：現場訂單依開關列印（號碼=訂單號碼後三碼）
+  if(paymentMethod !== '待付款' && printConfig.autoPrintNumberTicket){
+        try { printNumberTicket(order); }
+        catch(e) { console.error('列印號碼單失敗:', e); }
+    }
+
+}
+  if(paymentMethod === '待付款'){
+          showToast('已加入待付款', 500);
+        } else if(paymentMethod === '現金' && _cashReceived !== ''){
+          var _recv = Number(_cashReceived) || 0;
+          var _change = Math.max(0, _recv - _cashDue);
+          alert('結帳完成\n實收 $' + _recv + '　找零 $' + _change);
+        } else {
+                    alert('結帳完成');
+        }
+
+      resetOrderTypeFields();
 }
 
-// 列印廚房單
-if(order && printConfig.autoPrintKitchen){
-    try { printKitchenCopies(order); }
-    catch(e) { console.error('列印廚房單失敗:', e); }
-}
-
-        alert(paymentMethod === '待付款' ? '已加入待付款' : '結帳完成');
-}
 
 // ============================================================
 // v20260620 現金收款視窗（自製鍵盤，全程不調用系統鍵盤）
@@ -726,9 +846,11 @@ const selections = flattenSelections(product);
     const extra = selections.reduce((s,x)=>s + Number(x.price||0), 0);
     const payload = {
       rowId: state.configTarget.mode === 'edit' ? state.configTarget.rowId : id(),
-      productId: product.id,
-      name: product.name,
-      basePrice: Number(product.price||0),
+            productId: product.id,
+      name: product.name + getSizeSuffix(product),
+      basePrice: getEffectiveBasePrice(product),
+      sizeIndex: state.currentSizeIndex,
+
       qty: Math.max(1, Number(document.getElementById('itemQtyInput').value || 1)),
       note: document.getElementById('itemNoteInput').value.trim(),
       selections,
@@ -797,10 +919,11 @@ const selections = flattenSelections(product);
       document.getElementById('checkoutBtn').click();
     };
   }
-  if(document.getElementById('clearCartBtnModal')){
+   if(document.getElementById('clearCartBtnModal')){
     document.getElementById('clearCartBtnModal').onclick = ()=>{
       state.cart = [];
       state.editingOrderId = null;
+      resetOrderTypeFields();
       renderCart();
     };
   }
@@ -810,9 +933,11 @@ const selections = flattenSelections(product);
       if(!confirm('確定要清空購物車？')) return;
       state.cart = [];
       state.editingOrderId = null;
+      resetOrderTypeFields();
       renderCart();
     };
   }
+
     document.getElementById('discountAmountBtn').onclick = ()=>{
     openNumPad({
       title: '折扣金額',
@@ -956,6 +1081,16 @@ async function refreshPosLockState(){
 
   // 第 3 層：已登入且已開班
   lock.style.display = 'none';
+}
+// 浮動提示：顯示 ms 毫秒後自動消失，不需手動按確定
+function showToast(msg, ms){
+  var t = document.createElement('div');
+  t.textContent = msg;
+  t.style.cssText = 'position:fixed;left:50%;top:50%;transform:translate(-50%,-50%);'
+    + 'background:rgba(15,23,42,0.92);color:#fff;padding:14px 26px;border-radius:12px;'
+    + 'font-size:16px;z-index:99999;box-shadow:0 10px 30px rgba(0,0,0,0.3);pointer-events:none';
+  document.body.appendChild(t);
+  setTimeout(function(){ if(t.parentNode) t.parentNode.removeChild(t); }, ms || 500);
 }
 
 
